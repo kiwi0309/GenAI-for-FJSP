@@ -1,0 +1,1223 @@
+import tkinter as tk
+from tkinter import ttk # For potentially nicer widgets
+from tkinter import filedialog
+from tkinter import scrolledtext
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import random
+import threading # To run GA in the background
+import queue # To communicate with the GA thread
+import time # For slight delays or checks
+
+
+# ==== GA 參數 ====
+POP_SIZE = 50
+GENS = 500
+MUT_RATE = 0.2
+CROSS_RATE = 0.9
+
+# ==== 資料載入 (MODIFIED: Accepts paths) ====
+def load_data_from_paths(recipes_path, release_path):
+    """Loads data from specified file paths."""
+    if not recipes_path or not release_path:
+        raise ValueError("未提供 Recipes 或 Release 文件路徑。")
+    try:
+        recipes_df = pd.read_excel(recipes_path)
+        release_df = pd.read_excel(release_path)
+        return recipes_df, release_df
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"找不到文件：{e.filename}")
+    except Exception as e:
+        raise Exception(f"讀取 Excel 文件時出錯: {e}")
+
+# ==== 前處理 ====
+def preprocess_data(recipes_df, release_df):
+    operations_dict = {}
+    machine_list = recipes_df.columns[1:] # Assume 'operation' is first
+
+    for _, row in recipes_df.iterrows():
+        op = row['operation']
+        try:
+            # Basic parsing assuming 'O<type><index>' format like O11, O12
+            op_type = int(op[1])
+            op_idx = int(op[2:])
+        except (IndexError, ValueError, TypeError):
+             # Fallback if format is different or non-standard
+             # print(f"Warning: Could not parse operation type/index from '{op}'. Using defaults.")
+             op_type = op # Use the full name as type key
+             op_idx = 0 # Default index
+
+        available_machines = {}
+        for m in machine_list:
+            t = row[m]
+            if pd.notna(t) and str(t).strip() != '-':
+                try:
+                    available_machines[m] = int(t)
+                except ValueError:
+                     # print(f"Warning: Invalid processing time '{t}' for op '{op}' on machine '{m}'. Skipping machine.")
+                     pass # Skip invalid time entry for this machine
+
+        if not available_machines:
+             # print(f"Warning: Operation '{op}' has no available machines with valid times. Skipping operation.")
+             continue
+
+        if op_type not in operations_dict:
+            operations_dict[op_type] = []
+        operations_dict[op_type].append((op, op_idx, available_machines))
+
+    job_info = []
+    processed_job_types = set(operations_dict.keys())
+
+    for _, row in release_df.iterrows():
+        job_id = row['job']
+        try:
+            # Ensure type is treated consistently, e.g., as string if parsed that way above
+            job_type_raw = row['type']
+            job_type = int(job_type_raw) # Attempt conversion if needed, adjust based on op_type format
+            # Or if op_type uses string keys, keep job_type as needed: job_type = str(job_type_raw)
+
+        except (ValueError, TypeError):
+             print(f"Warning: Invalid job type '{row['type']}' for job '{job_id}'. Skipping job.")
+             continue
+
+        release_time = row['release time']
+        due_date = row['due date']
+
+        if job_type not in processed_job_types:
+             # print(f"Warning: Job type '{job_type}' for job '{job_id}' not found or has no valid ops in recipes. Skipping job.")
+             continue # Skip job if its type wasn't processed from recipes
+
+        # Sort operations for this job type based on index
+        job_ops_for_type = sorted(operations_dict[job_type], key=lambda x: x[1])
+        if not job_ops_for_type:
+             # print(f"Warning: Job type '{job_type}' exists but has no operations listed. Skipping job '{job_id}'.")
+             continue # Skip if no operations list
+
+        job_info.append({'job': job_id, 'type': job_type, 'release': release_time, 'due': due_date, 'operations': job_ops_for_type})
+
+    if not job_info:
+        raise ValueError("未能從提供的文件中處理任何有效的作業 (Job)。請檢查文件內容和格式。")
+
+    return job_info, machine_list.tolist()
+
+
+# ==== 染色體編碼 ====
+def generate_chromosome(jobs, machine_list):
+    """生成染色體，嚴格保持每個Job內部工序順序"""
+    op_sequence_part = []
+    machine_selection_part = []
+    
+    # 建立Job工序隊列
+    job_queues = {}
+    for job in jobs:
+        job_id = job['job']
+        # 按原始順序提取工序 (已預先排序)
+        operations = [op for op in job['operations']]
+        if operations:
+            job_queues[job_id] = {
+                'remaining_ops': operations.copy(),
+                'current_idx': 0
+            }
+    
+    # 隨機選擇Job逐步排程
+    while any(q['remaining_ops'] for q in job_queues.values()):
+        # 獲取仍有未排工序的Job列表
+        active_jobs = [job_id for job_id, q in job_queues.items() if q['remaining_ops']]
+        if not active_jobs:
+            break
+        
+        # 隨機選擇一個Job
+        selected_job = random.choice(active_jobs)
+        current_op = job_queues[selected_job]['remaining_ops'].pop(0)
+        
+        # 提取工序資訊
+        op_name, op_idx, available_machines = current_op
+        if not available_machines:
+            raise ValueError(f"Job {selected_job}的工序{op_name}無可用機器")
+        
+        # 選擇機器並記錄
+        chosen_machine = random.choice(list(available_machines.keys()))
+        op_sequence_part.append((selected_job, op_name))
+        machine_selection_part.append(chosen_machine)
+    
+    return (tuple(op_sequence_part), tuple(machine_selection_part))
+
+# ==== 突變操作改進 ====
+def mutate(chrom, jobs):
+    """強化變異操作檢查，防止工序順序破壞"""
+    op_sequence, machine_assignment = chrom
+    new_op_sequence = list(op_sequence)
+    new_machine_assignment = list(machine_assignment)
+    
+    # 突變類型1：交換不同Job的工序
+    if random.random() < MUT_RATE and len(new_op_sequence) >= 2:
+        attempts = 0
+        max_attempts = 20  # 增加嘗試次數確保找到有效交換
+        swapped = False
+        
+        while attempts < max_attempts and not swapped:
+            idx1, idx2 = random.sample(range(len(new_op_sequence)), 2)
+            job1, op1 = new_op_sequence[idx1]
+            job2, op2 = new_op_sequence[idx2]
+            
+            # 只允許交換不同Job的工序
+            if job1 != job2:
+                # 檢查交換後工序順序是否合法
+                temp_sequence = new_op_sequence.copy()
+                temp_sequence[idx1], temp_sequence[idx2] = temp_sequence[idx2], temp_sequence[idx1]
+                
+                if validate_operation_order(temp_sequence, jobs):
+                    new_op_sequence = temp_sequence
+                    # 同時交換機器分配
+                    new_machine_assignment[idx1], new_machine_assignment[idx2] = \
+                        new_machine_assignment[idx2], new_machine_assignment[idx1]
+                    swapped = True
+            attempts += 1
+    
+    # 突變類型2：隨機重置機器選擇
+    if random.random() < MUT_RATE and len(new_op_sequence) > 0:
+        idx = random.randint(0, len(new_op_sequence)-1)
+        job_id, op_name = new_op_sequence[idx]
+        
+        # 獲取合法機器列表
+        op_detail = next(
+            (op for j in jobs if j['job'] == job_id 
+             for op in j['operations'] if op[0] == op_name), 
+            None
+        )
+        if op_detail and len(op_detail[2]) > 1:
+            available_machines = list(op_detail[2].keys())
+            current_machine = new_machine_assignment[idx]
+            new_machine = random.choice([m for m in available_machines if m != current_machine])
+            new_machine_assignment[idx] = new_machine
+    
+    return (tuple(new_op_sequence), tuple(new_machine_assignment))
+
+# ==== 新增工序順序驗證函式 ====
+def validate_operation_order(op_sequence, jobs):
+    # 初始化每個Job的工序指針
+    job_progress = {j['job']: 0 for j in jobs}
+    
+    for op in op_sequence:
+        job_id, op_name = op
+        # 獲取當前Job的預期下一工序
+        expected_op = job['operations'][job_progress[job_id]][0]
+        if op_name != expected_op:
+            return False  # 順序不匹配
+        job_progress[job_id] += 1
+    
+    # 檢查所有Job是否完成所有工序
+    for job in jobs:
+        if job_progress[job['job']] != len(job['operations']):
+            return False
+    return True
+
+# ==== 改進交叉操作 ====
+def pox_crossover(p1_ops, p2_ops, num_jobs):
+    """改進型POX交叉，確保工序完整性"""
+    # 生成隨機Job子集
+    job_ids = [f"J{i+1}" for i in range(num_jobs)]
+    selected_jobs = set(random.sample(job_ids, k=random.randint(1, num_jobs-1)))
+    
+    # 子代1構造
+    child1 = [op for op in p1_ops if op[0] in selected_jobs]
+    remaining_ops_p2 = [op for op in p2_ops if op[0] not in selected_jobs]
+    child1 += remaining_ops_p2
+    
+    # 子代2構造
+    child2 = [op for op in p2_ops if op[0] in selected_jobs]
+    remaining_ops_p1 = [op for op in p1_ops if op[0] not in selected_jobs]
+    child2 += remaining_ops_p1
+    
+    # 驗證長度一致性
+    if len(child1) != len(p1_ops) or len(child2) != len(p2_ops):
+        return p1_ops, p2_ops  # 回退安全機制
+    
+    return tuple(child1), tuple(child2)
+
+# ==== 解碼時增加順序驗證 ====
+def decode_and_schedule(chromosome, jobs, machine_list):
+    op_sequence_keys, machine_assignment = chromosome
+    
+    # 新增工序順序驗證
+    if not validate_operation_order(op_sequence_keys, jobs):
+        raise ValueError("非法染色體: 工序順序驗證失敗")
+
+# ==== 解碼並計算 Makespan ====
+def decode_and_schedule(chromosome, jobs, machine_list):
+    op_sequence_keys, machine_assignment = chromosome
+    if len(op_sequence_keys) != len(machine_assignment):
+        raise ValueError("Chromosome structure error: sequence length differs from assignment length.")
+
+    machine_available_time = {m: 0 for m in machine_list}
+    job_last_op_end_time = {j['job']: j['release'] for j in jobs}
+    start_dict = {}
+    end_dict = {}
+    job_map = {j['job']: j for j in jobs}
+    operation_details = {}
+    for job in jobs:
+        for op_name, _, machines in job['operations']:
+            operation_details[(job['job'], op_name)] = machines
+
+    processed_ops_count = 0
+    for i, op_key in enumerate(op_sequence_keys):
+        job_id, op_name = op_key
+        if op_key not in operation_details:
+             # This indicates a mismatch between generated chromosome and job data
+             raise ValueError(f"Error decoding: Operation key '{op_key}' not found in job details.")
+
+        job_ops_available_machines = operation_details[op_key]
+        chosen_machine = machine_assignment[i]
+
+        if chosen_machine not in job_ops_available_machines:
+             # Handle invalid machine selection (e.g., due to faulty crossover/mutation)
+             # Option 1: Raise error (strict)
+             # raise ValueError(f"Invalid machine '{chosen_machine}' selected for {op_key}. Available: {list(job_ops_available_machines.keys())}")
+             # Option 2: Choose a random valid one (more forgiving)
+             valid_machines = list(job_ops_available_machines.keys())
+             if not valid_machines: raise ValueError(f"No valid machines for {op_key}!")
+             chosen_machine = random.choice(valid_machines)
+             # print(f"Warning: Corrected invalid machine for {op_key} to '{chosen_machine}'")
+
+
+        process_time = job_ops_available_machines[chosen_machine]
+        machine_ready_time = machine_available_time[chosen_machine]
+        job_ready_time = job_last_op_end_time[job_id]
+        start_time = max(machine_ready_time, job_ready_time)
+        end_time = start_time + process_time
+        start_dict[op_key] = (chosen_machine, start_time)
+        end_dict[op_key] = end_time
+        machine_available_time[chosen_machine] = end_time
+        job_last_op_end_time[job_id] = end_time
+        processed_ops_count += 1
+
+    if processed_ops_count != len(op_sequence_keys):
+         print(f"Warning: Processed {processed_ops_count} ops, expected {len(op_sequence_keys)}.")
+
+
+    makespan = max(end_dict.values()) if end_dict else 0
+    return makespan, start_dict, end_dict
+
+# ==== 適應度評估 ====
+def evaluate_population(population, jobs, machine_list):
+    fitness_scores = []
+    schedules_details = []
+    for i, chrom in enumerate(population):
+        try:
+            ms, sdict, edict = decode_and_schedule(chrom, jobs, machine_list)
+            fitness_scores.append(ms)
+            schedules_details.append({'chromosome': chrom, 'makespan': ms, 'start_dict': sdict, 'end_dict': edict})
+        except ValueError as e:
+             # print(f"Error evaluating chromosome {i}: {e}. Assigning high fitness.")
+             fitness_scores.append(float('inf'))
+             schedules_details.append({'chromosome': chrom, 'makespan': float('inf'), 'start_dict': {}, 'end_dict': {}})
+        except Exception as e: # Catch unexpected errors
+             # print(f"Unexpected error evaluating chromosome {i}: {e}. Assigning high fitness.")
+             fitness_scores.append(float('inf'))
+             schedules_details.append({'chromosome': chrom, 'makespan': float('inf'), 'start_dict': {}, 'end_dict': {}})
+
+    return schedules_details, fitness_scores
+
+# ==== 選擇 (Tournament) ====
+def selection(population, fitness_scores, tournament_size=3):
+    selected = []
+    pop_indices = list(range(len(population)))
+    # Ensure population size is sufficient for selection pool
+    if not population or len(population) < tournament_size:
+        # print("Warning: Population too small for tournament selection. Returning original population or empty list.")
+        return population[:] # Return a copy
+
+    # Adjust selection size if population is small but usable
+    num_to_select = min(len(population) // 2, len(population)) # Ensure we select at most the current pop size
+    if num_to_select == 0 and len(population) > 0: num_to_select = 1 # Select at least one if possible
+
+    for _ in range(num_to_select):
+        tournament_indices = random.sample(pop_indices, tournament_size)
+        tournament_fitness = [fitness_scores[i] for i in tournament_indices]
+        winner_index_in_tournament = np.argmin(tournament_fitness)
+        winner_original_index = tournament_indices[winner_index_in_tournament]
+        selected.append(population[winner_original_index])
+    return selected
+
+
+# ==== 交配 (POX + Uniform) ====
+def pox_crossover(p1_ops, p2_ops, num_jobs):
+    p_len = len(p1_ops)
+    if p_len == 0: return (), () # Handle empty case
+    # Ensure num_jobs is at least 1 for splitting
+    if num_jobs < 1: raise ValueError("Number of jobs must be at least 1 for POX crossover.")
+    # Generate job IDs based on num_jobs, assuming format J1, J2...
+    job_ids_str = [f"J{i+1}" for i in range(num_jobs)] # Corrected J1...J<num_jobs>
+    random.shuffle(job_ids_str)
+    # Ensure split point is valid even if num_jobs is 1 or 2
+    split_point = random.randint(1, max(1, num_jobs - 1)) if num_jobs > 1 else 1
+
+    set1_jobs = set(job_ids_str[:split_point])
+    set2_jobs = set(job_ids_str[split_point:])
+
+    child1_ops = [op for op in p1_ops if op[0] in set1_jobs]
+    child2_ops = [op for op in p2_ops if op[0] in set1_jobs]
+
+    p2_ops_for_child1 = [op for op in p2_ops if op[0] in set2_jobs]
+    p1_ops_for_child2 = [op for op in p1_ops if op[0] in set2_jobs]
+
+    final_child1_ops = tuple(child1_ops + p2_ops_for_child1)
+    final_child2_ops = tuple(child2_ops + p1_ops_for_child2)
+
+    # Validation (optional but recommended)
+    if len(final_child1_ops) != p_len or len(final_child2_ops) != p_len:
+        # Fallback mechanism: return parents if crossover failed
+        # print("Warning: POX crossover length mismatch. Returning parents.")
+        return tuple(p1_ops), tuple(p2_ops)
+
+    return final_child1_ops, final_child2_ops
+
+def uniform_crossover_machines(p1_machines, p2_machines):
+    child1_machines = []
+    child2_machines = []
+    for i in range(len(p1_machines)):
+        if random.random() < 0.5:
+            child1_machines.append(p1_machines[i])
+            child2_machines.append(p2_machines[i])
+        else:
+            child1_machines.append(p2_machines[i])
+            child2_machines.append(p1_machines[i])
+    return tuple(child1_machines), tuple(child2_machines)
+
+def crossover(p1, p2, jobs):
+    p1_ops, p1_mach = p1
+    p2_ops, p2_mach = p2
+    num_unique_jobs = len(jobs)
+    child1_ops, child2_ops = pox_crossover(p1_ops, p2_ops, num_unique_jobs)
+    child1_mach, child2_mach = uniform_crossover_machines(p1_mach, p2_mach)
+    return (child1_ops, child1_mach), (child2_ops, child2_mach)
+
+# ==== 突變 (Swap + Reset) ====
+def find_op_details(job_id, op_name, jobs):
+     """Helper to find operation details within the jobs structure."""
+     job_obj = next((j for j in jobs if j['job'] == job_id), None)
+     if job_obj:
+         op_detail = next(((op, idx, machines) for op, idx, machines in job_obj['operations'] if op == op_name), None)
+         return op_detail
+     return None
+
+def mutate(chrom, jobs):
+    op_sequence, machine_assignment = chrom
+    new_op_sequence = list(op_sequence)
+    new_machine_assignment = list(machine_assignment)
+    
+    # Mutation 1: Swap two operations of different jobs
+    if random.random() < MUT_RATE and len(new_op_sequence) >= 2:
+        attempts = 0
+        max_attempts = 10
+        swapped = False
+        while attempts < max_attempts and not swapped:
+            idx1, idx2 = random.sample(range(len(new_op_sequence)), 2)
+            job1, op1 = new_op_sequence[idx1]
+            job2, op2 = new_op_sequence[idx2]
+            if job1 != job2:
+                new_op_sequence[idx1], new_op_sequence[idx2] = new_op_sequence[idx2], new_op_sequence[idx1]
+                new_machine_assignment[idx1], new_machine_assignment[idx2] = new_machine_assignment[idx2], new_machine_assignment[idx1]
+                swapped = True
+            attempts += 1
+    
+    # Mutation 2: Change machine assignment
+    if random.random() < MUT_RATE and len(new_op_sequence) > 0:
+        idx = random.randint(0, len(new_op_sequence)-1)
+        job_id, op_name = new_op_sequence[idx]
+        op_detail = next((op for j in jobs if j['job'] == job_id for op in j['operations'] if op[0] == op_name), None)
+        if op_detail:
+            available_machines = list(op_detail[2].keys())
+            if len(available_machines) > 1:
+                current_machine = new_machine_assignment[idx]
+                new_machine = random.choice([m for m in available_machines if m != current_machine])
+                new_machine_assignment[idx] = new_machine
+    
+    return (tuple(new_op_sequence), tuple(new_machine_assignment))
+
+
+# ==== 主 GA 執行 (MODIFIED: Accepts dataframes, returns dictionary) ====
+def genetic_algorithm_logic(recipes_df, release_df):
+    """Runs the GA logic and returns results or error."""
+    try:
+        jobs, machine_list = preprocess_data(recipes_df, release_df)
+    except ValueError as e:
+        return {'success': False, 'error': f"資料預處理失敗: {e}"}
+    except Exception as e:
+         return {'success': False, 'error': f"資料預處理時發生意外錯誤: {e}"}
+
+
+    if not jobs:
+        return {'success': False, 'error': "沒有有效的 Job 資料用於執行 GA。"}
+
+    population = []
+    generation_attempts = 0
+    max_gen_attempts = POP_SIZE * 5 # Allow more attempts
+
+    while len(population) < POP_SIZE and generation_attempts < max_gen_attempts:
+         try:
+             chrom = generate_chromosome(jobs, machine_list)
+             population.append(chrom)
+         except ValueError as e:
+             # Log error if chromosome generation fails, maybe critical
+             # print(f"Error generating chromosome: {e}") # Optional logging
+             pass # Try generating next one
+         except Exception as e:
+             # print(f"Unexpected error generating chromosome: {e}") # Optional logging
+             pass
+         generation_attempts += 1
+
+
+    if len(population) < min(POP_SIZE, 1): # Need at least one chromosome
+         return {'success': False, 'error': "無法生成任何有效的初始染色體。"}
+    elif len(population) < POP_SIZE:
+         print(f"Warning: Generated only {len(population)} initial chromosomes (target {POP_SIZE}).")
+
+
+    best_overall_chromosome = None
+    best_overall_makespan = float('inf')
+    best_overall_start_dict = None
+    best_overall_end_dict = None
+    best_makespan_per_gen = []
+    all_machines = machine_list # Capture the machine list derived from data
+
+    for gen in range(GENS):
+        # Evaluate population
+        schedules_details, fitness_scores = evaluate_population(population, jobs, machine_list)
+
+        valid_makespans = [s for s in fitness_scores if s != float('inf')]
+        if not valid_makespans:
+             # If all fitnesses are infinite, GA cannot proceed meaningfully
+             # print(f"Warning: All individuals have infinite makespan in generation {gen+1}. Stopping.")
+             # Return the best found so far, even if it's inf
+             break
+
+
+        current_best_idx = np.argmin(fitness_scores)
+        current_best_makespan = fitness_scores[current_best_idx]
+
+        if current_best_makespan < best_overall_makespan:
+            best_overall_makespan = current_best_makespan
+            best_schedule_info = schedules_details[current_best_idx]
+            best_overall_chromosome = best_schedule_info['chromosome']
+            best_overall_start_dict = best_schedule_info['start_dict']
+            best_overall_end_dict = best_schedule_info['end_dict']
+
+        best_makespan_per_gen.append(best_overall_makespan)
+
+        # Selection
+        selected_parents = selection(population, fitness_scores, tournament_size=3)
+
+        if not selected_parents:
+            # print(f"Warning: Selection returned no parents in generation {gen+1}. Stopping.")
+            break # Stop if selection fails
+
+        # Crossover and Mutation
+        next_gen = []
+         # Elitism: Add the best overall chromosome found so far
+        if best_overall_chromosome is not None:
+            next_gen.append(best_overall_chromosome)
+
+        while len(next_gen) < POP_SIZE:
+            p1, p2 = random.choices(selected_parents, k=2) # Select with replacement is okay here
+            if random.random() < CROSS_RATE:
+                child1, child2 = crossover(p1, p2, jobs)
+            else:
+                child1, child2 = p1, p2
+            mutated_child1 = mutate(child1, jobs)
+            mutated_child2 = mutate(child2, jobs)
+            next_gen.append(mutated_child1)
+            if len(next_gen) < POP_SIZE:
+                next_gen.append(mutated_child2)
+
+        population = next_gen[:POP_SIZE]
+
+    if best_overall_chromosome is None:
+        return {'success': False, 'error': "GA 完成，但未能找到任何有效的排程。"}
+
+    # Return results in a dictionary
+    return {
+        'success': True,
+        'chromosome': best_overall_chromosome,
+        'makespan': best_overall_makespan,
+        'start_dict': best_overall_start_dict,
+        'end_dict': best_overall_end_dict,
+        'jobs': jobs, # Pass job info back
+        'history': best_makespan_per_gen,
+        'machines': all_machines # Include machine list
+    }
+
+
+# ==== 最大延遲時間計算 ====
+def calculate_max_lateness(end_dict, jobs):
+    if not end_dict or not jobs:
+        # print("Warning: Cannot calculate max lateness, schedule or job data missing.")
+        return None, "排程或工作資料缺失"
+
+    max_lateness = -float('inf')
+    job_completion_times = {}
+    details = [] # Store details for output
+
+    # Find completion time for each job
+    for (job_id, op_name), end_time in end_dict.items():
+        job_completion_times[job_id] = max(job_completion_times.get(job_id, -1), end_time)
+
+    found_lateness = False
+    for job_info in jobs:
+        job_id = job_info['job']
+        due_date = job_info['due']
+        if job_id in job_completion_times:
+            completion_time = job_completion_times[job_id]
+            lateness = completion_time - due_date
+            details.append(f"  - 工作 {job_id}: 完成 = {completion_time:.2f}, 到期 = {due_date}, 延遲 = {lateness:.2f}")
+            max_lateness = max(max_lateness, lateness)
+            found_lateness = True
+        else:
+            details.append(f"  - 警告: 未找到工作 {job_id} 的完成時間。")
+
+
+    if not found_lateness:
+        return None, "未能計算任何工作的延遲時間。"
+    if max_lateness == -float('inf'): # Should not happen if found_lateness is True, but as safeguard
+        return None, "計算延遲時間時發生未知錯誤。"
+
+
+    # Combine results and details string
+    details_str = "\n".join(details)
+    return max_lateness, details_str
+
+# ==== 輔助函數：獲取工作完成時間 ====
+def get_job_completion_times(end_dict):
+    """從 end_dict 計算每個工作的最終完成時間。"""
+    job_completion_times = {}
+    if not end_dict:
+        return job_completion_times
+    for (job_id, op_name), end_time in end_dict.items():
+        job_completion_times[job_id] = max(job_completion_times.get(job_id, -1), end_time)
+    return job_completion_times
+
+# ==== 總延遲時間計算 ====
+def calculate_total_tardiness(end_dict, jobs):
+    """計算所有工作的總延遲時間 (Sum of max(0, Cj - dj))。"""
+    if not jobs: return 0, "沒有工作數據。"
+    job_completion_times = get_job_completion_times(end_dict)
+    if not job_completion_times: return 0, "沒有有效的排程完成時間。"
+
+    total_tardiness = 0
+    details = []
+    for job_info in jobs:
+        job_id = job_info['job']
+        due_date = job_info['due']
+        if job_id in job_completion_times:
+            completion_time = job_completion_times[job_id]
+            tardiness = max(0, completion_time - due_date)
+            total_tardiness += tardiness
+            if tardiness > 0:
+                details.append(f"  - 工作 {job_id}: 完成 = {completion_time:.2f}, 到期 = {due_date}, 延遲 = {tardiness:.2f}")
+        else:
+            details.append(f"  - 警告: 未找到工作 {job_id} 的完成時間。")
+
+    if not details:
+         details.append("  (沒有計算任何工作的延遲)")
+    elif all('警告' in s or '延遲 = 0.00' in s for s in details if not s.startswith("  (")):
+         details.append("  (所有工作均準時完成)")
+
+
+    details_str = "\n".join(details)
+    return total_tardiness, details_str
+
+# ==== 延遲工作數計算 ====
+def calculate_num_tardy_jobs(end_dict, jobs):
+    """計算延遲完成的工作數量 (Count of Cj > dj)。"""
+    if not jobs: return 0, "沒有工作數據。"
+    job_completion_times = get_job_completion_times(end_dict)
+    if not job_completion_times: return 0, "沒有有效的排程完成時間。"
+
+    num_tardy = 0
+    details = []
+    for job_info in jobs:
+        job_id = job_info['job']
+        due_date = job_info['due']
+        if job_id in job_completion_times:
+            completion_time = job_completion_times[job_id]
+            if completion_time > due_date:
+                num_tardy += 1
+                details.append(f"  - 工作 {job_id}: 完成 = {completion_time:.2f}, 到期 = {due_date} (延遲)")
+        else:
+            details.append(f"  - 警告: 未找到工作 {job_id} 的完成時間。")
+
+    if not details and jobs: # If no jobs were processed for details
+         details.append("  (未能檢查任何工作是否延遲)")
+    elif num_tardy == 0 and details:
+         details.append("  (所有工作均準時完成)")
+
+    details_str = "\n".join(details)
+    return num_tardy, details_str
+
+# ==== 總流程時間計算 ====
+def calculate_total_flow_time(end_dict, jobs):
+    """計算所有工作的總流程時間 (Sum of Cj - rj)。"""
+    if not jobs: return 0, "沒有工作數據。"
+    job_completion_times = get_job_completion_times(end_dict)
+    if not job_completion_times: return 0, "沒有有效的排程完成時間。"
+
+    total_flow_time = 0
+    details = []
+    for job_info in jobs:
+        job_id = job_info['job']
+        release_time = job_info['release']
+        if job_id in job_completion_times:
+            completion_time = job_completion_times[job_id]
+            # Flow time is Completion - Release Time. Ensure Cj >= rj.
+            flow_time = max(0, completion_time - release_time)
+            total_flow_time += flow_time
+            details.append(f"  - 工作 {job_id}: 完成 = {completion_time:.2f}, 釋放 = {release_time}, 流程時間 = {flow_time:.2f}")
+        else:
+            details.append(f"  - 警告: 未找到工作 {job_id} 的完成時間。")
+
+    if not details:
+        details.append("  (未能計算任何工作的流程時間)")
+
+    details_str = "\n".join(details)
+    return total_flow_time, details_str
+
+# ==== 甘特圖繪製 ====
+def plot_gantt_chart(start_dict, end_dict, jobs, machine_list, makespan):
+    """繪製甘特圖，使用淺色背景、黑色文字，並對圖例進行自然排序。"""
+    if not start_dict or not end_dict:
+        # ... (錯誤處理部分不變) ...
+        try:
+            tk.messagebox.showwarning("繪圖錯誤", "排程資料為空，無法繪製甘特圖。")
+        except NameError:
+            print("錯誤: 排程資料為空，無法繪製甘特圖。")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, max(6, len(machine_list) * 0.6)))
+
+    # --- 機器 Y 軸順序 ---
+    # ... (機器排序部分不變) ...
+    try:
+        sorted_machine_list = sorted(machine_list, key=lambda m: (int(m[1:]) if m[1:].isdigit() else float('inf'), m))
+    except:
+        sorted_machine_list = sorted(machine_list)
+    machine_order_display = sorted_machine_list[::-1]
+    machine_y_coord = {m: i for i, m in enumerate(machine_order_display)}
+
+
+    # --- 工作顏色分配 與 圖例順序 (使用自然排序) ---
+    # 提取所有唯一的 Job ID
+    job_ids_set = set(key[0] for key in start_dict.keys())
+    if not job_ids_set:
+        # ... (錯誤處理部分不變) ...
+        try:
+            tk.messagebox.showwarning("繪圖錯誤", "排程字典中未找到任何工作，無法繪製甘特圖。")
+        except NameError:
+             print("錯誤：排程字典中未找到任何工作。")
+        return
+
+    # *** 定義自然排序的 key 函數 ***
+    def natural_sort_key(job_id_str):
+        """
+        用於自然排序的鍵函數。
+        假設 Job ID 格式為 'J' 後面跟數字 (例如 'J1', 'J10')。
+        """
+        try:
+            # 提取 'J' 後面的數字部分並轉換為整數
+            return int(job_id_str[1:])
+        except (ValueError, IndexError, TypeError):
+            # 如果格式不符，則將其排在後面 (或進行字母排序)
+            return float('inf') # 將非標準格式排到最後
+
+    # *** 使用自然排序對 Job ID 進行排序 ***
+    job_ids_sorted_naturally = sorted(list(job_ids_set), key=natural_sort_key)
+
+    # --- 顏色分配 ---
+    num_jobs = len(job_ids_sorted_naturally)
+    colormap = plt.get_cmap('Set3', num_jobs)
+    job_colors = {job_id: colormap(i % colormap.N) for i, job_id in enumerate(job_ids_sorted_naturally)}
+
+    # --- 繪製長條圖 ---
+    # ... (繪製 barh 和 text 的迴圈部分不變) ...
+    plotted_items = 0
+    min_start_time = float('inf')
+    max_end_time = 0
+    for (job_id, op_name), (machine, start_time) in start_dict.items():
+        # ... (迴圈內部邏輯不變) ...
+        if (job_id, op_name) not in end_dict: continue
+        end_time = end_dict[(job_id, op_name)]
+        duration = end_time - start_time
+        if duration < 0: continue
+        if machine not in machine_y_coord: continue
+        y_pos = machine_y_coord[machine]
+        color = job_colors.get(job_id, 'lightgrey')
+        label_suffix = op_name.split('O')[-1] if 'O' in op_name else op_name
+        label = f"{job_id}-{label_suffix}"
+        ax.barh(y=y_pos, width=duration, left=start_time, height=0.6,
+                color=color, edgecolor='grey', linewidth=0.5, alpha=0.9)
+        text_color = 'black'
+        if duration > makespan * 0.01:
+            ax.text(start_time + duration / 2, y_pos, label,
+                    ha='center', va='center', fontsize=7, color=text_color, weight='normal')
+        plotted_items += 1
+        min_start_time = min(min_start_time, start_time)
+        max_end_time = max(max_end_time, end_time)
+    # ... (處理 plotted_items == 0 的部分不變) ...
+    if plotted_items == 0:
+        try:
+            tk.messagebox.showwarning("繪圖警告", "沒有任何操作被成功繪製到甘特圖上。")
+        except NameError:
+             print("警告：沒有任何操作被繪製。")
+        plt.close(fig)
+        return
+
+    # --- 圖表格式化 ---
+    # ... (設定 yticks, labels, title, grid, xlim 的部分不變) ...
+    ax.set_yticks(list(machine_y_coord.values()))
+    ax.set_yticklabels(machine_order_display)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Machine")
+    actual_makespan = max_end_time if end_dict else 0
+    ax.set_title(f"Flexible Job Shop Schedule Gantt Chart (Makespan ≈ {actual_makespan:.2f})")
+    ax.grid(True, axis='x', linestyle=':', linewidth=0.6, color='grey')
+    ax.set_axisbelow(True)
+    plot_start = max(0, min_start_time - actual_makespan * 0.05) if min_start_time != float('inf') else 0
+    plot_end = actual_makespan * 1.05 if actual_makespan > 0 else 10
+    ax.set_xlim(left=plot_start, right=plot_end)
+
+
+    # --- 圖例 (使用自然排序後的 Job ID) ---
+    # *** 確保使用自然排序後的列表來創建圖例 ***
+    legend_patches = [mpatches.Patch(color=job_colors.get(job_id, 'lightgrey'), label=job_id)
+                      for job_id in job_ids_sorted_naturally] # 使用排序後的列表
+    ax.legend(handles=legend_patches, bbox_to_anchor=(1.02, 1), loc='upper left', title="Jobs", fontsize='small')
+
+    plt.tight_layout(rect=[0, 0, 0.88, 1])
+    plt.show()
+
+
+# ==============================================================================
+# GUI Class Definition
+# ==============================================================================
+
+class FJSP_GUI:
+    def __init__(self, master):
+        # ... (init 不變) ...
+        self.master = master
+        master.title("FJSP 基因演算法工具 v1.3") # Update title maybe
+        master.geometry("700x600") # Slightly taller for more output maybe
+
+        # --- State Variables ---
+        self.recipes_path = tk.StringVar()
+        self.release_path = tk.StringVar()
+        self.ga_results_cache = None
+        self.ga_run_successful = False
+        self.is_ga_running = False
+        self.ga_thread = None
+        self.result_queue = queue.Queue()
+        self.command_to_process_after_ga = None
+
+        # --- GUI Setup ---
+        self.create_widgets()
+
+    # ... (create_widgets, update_output, load_recipes, load_release, reset_ga_cache 不變) ...
+    def create_widgets(self):
+        # --- File Loading Frame ---
+        file_frame = ttk.LabelFrame(self.master, text="步驟 1: 匯入 Excel 檔案", padding=(10, 5))
+        file_frame.pack(pady=10, padx=10, fill=tk.X)
+
+        ttk.Button(file_frame, text="選擇 Recipes 檔案 (.xlsx)", command=self.load_recipes).grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.recipes_label = ttk.Label(file_frame, textvariable=self.recipes_path, wraplength=350) # Give it a name
+        self.recipes_label.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+
+        ttk.Button(file_frame, text="選擇 Release 檔案 (.xlsx)", command=self.load_release).grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.release_label = ttk.Label(file_frame, textvariable=self.release_path, wraplength=350) # Give it a name
+        self.release_label.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
+
+        # --- Command Frame ---
+        cmd_frame = ttk.LabelFrame(self.master, text="步驟 2: 輸入自然語言指令", padding=(10, 5))
+        cmd_frame.pack(pady=10, padx=10, fill=tk.X)
+
+        ttk.Label(cmd_frame, text="指令:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.cmd_entry = ttk.Entry(cmd_frame, width=60, state=tk.DISABLED)
+        self.cmd_entry.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
+        self.cmd_entry.bind("<Return>", self.submit_command_event) # Bind Enter key
+
+        self.submit_button = ttk.Button(cmd_frame, text="執行指令", command=self.submit_command, state=tk.DISABLED)
+        self.submit_button.grid(row=0, column=2, padx=5, pady=5)
+
+        cmd_frame.columnconfigure(1, weight=1) # Allow entry to expand
+
+        # --- Output Frame ---
+        out_frame = ttk.LabelFrame(self.master, text="步驟 3: 結果與訊息", padding=(10, 5))
+        out_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+        self.output_text = scrolledtext.ScrolledText(out_frame, wrap=tk.WORD, height=18, width=80) # Increased height
+        self.output_text.pack(fill=tk.BOTH, expand=True)
+        self.output_text.configure(state='disabled') # Make read-only initially
+
+        self.update_output("歡迎使用 FJSP 基因演算法工具。\n請先依序選擇 Recipes 和 Release Excel 檔案。")
+
+    def update_output(self, message):
+        """Appends a message to the output text area."""
+        self.output_text.configure(state='normal') # Enable writing
+        self.output_text.insert(tk.END, message + "\n")
+        self.output_text.see(tk.END) # Scroll to the end
+        self.output_text.configure(state='disabled') # Disable writing
+
+    def load_recipes(self):
+        """Opens file dialog to select recipes file."""
+        f_path = filedialog.askopenfilename(title="選擇 Recipes 檔案", filetypes=[("Excel files", "*.xlsx")])
+        if f_path:
+            self.recipes_path.set(f_path)
+            self.update_output(f"Recipes 檔案已選擇: {f_path.split('/')[-1]}") # Show only filename
+            self.check_files_loaded()
+            self.reset_ga_cache() # Reset GA if files change
+
+    def load_release(self):
+        """Opens file dialog to select release file."""
+        f_path = filedialog.askopenfilename(title="選擇 Release 檔案", filetypes=[("Excel files", "*.xlsx")])
+        if f_path:
+            self.release_path.set(f_path)
+            self.update_output(f"Release 檔案已選擇: {f_path.split('/')[-1]}") # Show only filename
+            self.check_files_loaded()
+            self.reset_ga_cache() # Reset GA if files change
+
+    def reset_ga_cache(self):
+        """Resets GA results when input files change."""
+        if self.ga_results_cache is not None:
+            self.update_output("提示：輸入檔案已更改，之前的計算結果已清除。")
+        self.ga_results_cache = None
+        self.ga_run_successful = False
+        # Do not reset is_ga_running here, handle ongoing runs if needed
+
+    # **** MODIFIED check_files_loaded ****
+    def check_files_loaded(self):
+        """Enables command input if both files are loaded."""
+        if self.recipes_path.get() and self.release_path.get():
+            self.cmd_entry.configure(state=tk.NORMAL)
+            self.submit_button.configure(state=tk.NORMAL)
+            # ** Update help text with new commands **
+            self.update_output("檔案已就緒，您可以輸入指令 (例: 'makespan', 'gantt', 'lateness', '總延遲', '延遲數量', '總流程時間', '重新計算', '我要全部', 'exit')")
+        else:
+            self.cmd_entry.configure(state=tk.DISABLED)
+            self.submit_button.configure(state=tk.DISABLED)
+
+    def submit_command_event(self, event):
+        """Handles the Enter key press in the command entry."""
+        self.submit_command()
+
+    # **** MODIFIED submit_command ****
+    def submit_command(self):
+        """Handles the submission of a command."""
+        if self.is_ga_running:
+            self.update_output("(!) 請稍候，基因演算法正在執行中...")
+            return
+
+        command = self.cmd_entry.get().strip().lower()
+        if not command:
+            return
+
+        self.update_output(f"> {command}") # Log user command
+        self.cmd_entry.delete(0, tk.END) # Clear input field
+
+        # --- Define Keywords ---
+        exit_keywords = ['exit', 'quit', '離開', '結束']
+        recalculate_keywords = ['重新計算', 'recalculate', '重算']
+        all_keywords = ['我要全部', 'all', '全部結果', '全部']
+
+        # ** Update keywords that require GA results **
+        ga_dependent_keywords = [
+            'makespan', '最小總完工時間',             # Cmax
+            'gantt', '甘特圖',                     # Gantt Chart
+            'lateness', '最大延遲時間',           # Lmax
+            'total tardiness', '總延遲', '合計延遲', # Total Tardiness
+            'tardy jobs', '延遲數量', '延遲工作數',  # Num Tardy Jobs
+            'total flow time', '總流程時間',       # Total Flow Time
+            'convergence', '收斂曲線',             # Convergence Curve
+            '我要全部', 'all', '全部結果', '全部'    # All Results Trigger
+        ]
+        # Map keywords to internal command names for clarity
+        command_map = {
+            "makespan": ["makespan", "總完工時間"],
+            "gantt": ["gantt", "甘特圖"],
+            "lateness": ["lateness", "最大延遲時間"],
+            "total_tardiness": ["total tardiness", "總延遲", "合計延遲"],
+            "num_tardy": ["tardy jobs", "延遲數量", "延遲工作數"],
+            "total_flowtime": ["total flow time", "總流程時間"],
+            "convergence": ["convergence", "收斂曲線"],
+            "all": all_keywords # Reuse list
+        }
+
+        # --- Parse Command ---
+        if any(k in command for k in exit_keywords):
+            self.update_output("正在關閉程式...")
+            self.master.quit()
+            return
+
+        # --- Handle "重新計算" ---
+        if any(k in command for k in recalculate_keywords):
+            self.update_output("收到重新計算指令，清除緩存並啟動新的 GA 計算...")
+            self.reset_ga_cache()
+            self.command_to_process_after_ga = "recalculate" # Special flag
+            self.trigger_ga_run()
+            return
+
+        # --- Determine required command and if GA is needed ---
+        requires_ga = False
+        specific_command = None
+        for cmd_key, keywords in command_map.items():
+            if any(k in command for k in keywords):
+                 requires_ga = True # All mapped commands require GA
+                 specific_command = cmd_key
+                 break # Found the command
+
+        # --- Execute or Trigger GA ---
+        if requires_ga:
+            if not self.ga_run_successful:
+                self.update_output("需要執行 GA 計算...")
+                self.command_to_process_after_ga = specific_command # Store command to run after GA
+                self.trigger_ga_run()
+            else:
+                # GA already ran, process command immediately
+                self.update_output("使用先前計算結果處理指令...")
+                if specific_command == "all":
+                    self.display_all_results() # Handle "all" command
+                elif specific_command:
+                    self.process_command_with_results(specific_command) # Handle single command
+                # else: Should not happen if specific_command was set
+            return # Handled
+
+        # --- Unrecognized Command ---
+        # Check if it looked like a GA command but wasn't matched
+        if any(k in command for k in ga_dependent_keywords) and not specific_command:
+             self.update_output(f"(!) 指令 '{command}' 看起來需要計算，但無法完全識別，請檢查關鍵字。")
+        else:
+             self.update_output(f"(!) 無法識別的指令: '{command}'")
+
+
+    # (保留 trigger_ga_run 不變)
+    def trigger_ga_run(self):
+        """Initiates the GA run in a separate thread."""
+        if self.is_ga_running: return # Should not happen based on checks in submit_command
+
+        # Ensure file paths are valid before starting thread
+        recipes_p = self.recipes_path.get()
+        release_p = self.release_path.get()
+        if not recipes_p or not release_p:
+            self.update_output("(!) 錯誤：未選擇有效的 Recipes 或 Release 檔案。")
+            # Also reset the command waiting flag
+            self.command_to_process_after_ga = None
+            return
+
+        self.update_output("   正在啟動基因演算法背景執行緒...")
+        self.is_ga_running = True
+        self.submit_button.configure(state=tk.DISABLED)
+        self.cmd_entry.configure(state=tk.DISABLED)
+
+        # Clear queue before starting
+        while not self.result_queue.empty():
+            try: self.result_queue.get_nowait()
+            except queue.Empty: break
+
+        # Start GA thread
+        self.ga_thread = threading.Thread(
+            target=self.run_ga_thread_wrapper,
+            args=(recipes_p, release_p, self.result_queue),
+            daemon=True
+        )
+        self.ga_thread.start()
+        self.master.after(100, self.check_ga_queue) # Start checking queue
+
+
+    # **** MODIFIED check_ga_queue ****
+    def check_ga_queue(self):
+        """Checks the queue for results from the GA thread."""
+        try:
+            result = self.result_queue.get_nowait()
+
+            # --- GA Finished ---
+            self.is_ga_running = False
+            # Re-enable buttons only if files are still validly selected
+            if self.recipes_path.get() and self.release_path.get():
+                self.submit_button.configure(state=tk.NORMAL)
+                self.cmd_entry.configure(state=tk.NORMAL)
+            else: # Disable if files got unselected somehow during run
+                 self.submit_button.configure(state=tk.DISABLED)
+                 self.cmd_entry.configure(state=tk.DISABLED)
+
+            if result['success']:
+                self.update_output(f"(✓) 基因演算法成功完成。Makespan: {result['makespan']:.2f}")
+                self.ga_results_cache = result
+                self.ga_run_successful = True
+
+                # --- Process the command that triggered this GA run ---
+                command_to_run = self.command_to_process_after_ga
+                self.command_to_process_after_ga = None # Reset flag
+
+                if command_to_run == "recalculate":
+                    self.update_output("   重新計算完成。")
+                    self.process_command_with_results("makespan") # Show new makespan
+                elif command_to_run == "all":
+                    self.display_all_results() # Display all results
+                elif command_to_run: # If it was a standard command like 'gantt', 'total_tardiness' etc
+                    self.process_command_with_results(command_to_run)
+                # else: No specific command was waiting
+
+            else:
+                self.update_output(f"(X) 基因演算法執行失敗: {result.get('error', '未知錯誤')}")
+                self.ga_results_cache = None
+                self.ga_run_successful = False
+                self.command_to_process_after_ga = None # Reset flag on failure too
+
+        except queue.Empty:
+            # If queue is empty, GA is still running
+            if self.is_ga_running:
+                self.master.after(200, self.check_ga_queue) # Check again shortly
+        except Exception as e:
+             # Catch unexpected errors during queue check/processing
+             self.update_output(f"(!) 檢查 GA 結果時發生錯誤: {e}")
+             self.is_ga_running = False # Ensure state is reset
+             self.submit_button.configure(state=tk.NORMAL) # Re-enable controls
+             self.cmd_entry.configure(state=tk.NORMAL)
+             self.command_to_process_after_ga = None
+
+
+    # (保留 run_ga_thread_wrapper 不變)
+    def run_ga_thread_wrapper(self, recipes_p, release_p, q):
+        """Wrapper to run GA logic and put results/error in queue."""
+        try:
+            # **Load data within the thread**
+            recipes_df, release_df = load_data_from_paths(recipes_p, release_p)
+            results = genetic_algorithm_logic(recipes_df, release_df)
+            q.put(results)
+        except Exception as e:
+            # Ensure any exception is caught and reported back
+            import traceback
+            print(f"Error in GA thread: {e}\n{traceback.format_exc()}") # Log detailed error
+            q.put({'success': False, 'error': f"執行 GA 時發生線程錯誤: {e}"})
+
+
+    # **** MODIFIED process_command_with_results ****
+    def process_command_with_results(self, command_key):
+        """Processes commands that require GA results, using the cache.
+           Uses internal command keys like 'makespan', 'total_tardiness', etc.
+        """
+        if not self.ga_run_successful or self.ga_results_cache is None:
+            self.update_output("(!) 錯誤：無法處理指令，因為 GA 計算未成功或結果不可用。")
+            return
+
+        cache = self.ga_results_cache
+        processed = False
+
+        try:
+            if command_key == "makespan":
+                self.update_output(f"   => 總完工時間 (Makespan): {cache['makespan']:.2f}")
+                processed = True
+
+            elif command_key == "gantt":
+                self.update_output("   => 正在準備繪製甘特圖...")
+                plot_gantt_chart(
+                    cache['start_dict'], cache['end_dict'], cache['jobs'],
+                    cache['machines'], cache['makespan']
+                )
+                self.update_output("      (甘特圖應在單獨視窗中顯示)")
+                processed = True
+
+            elif command_key == "lateness":
+                self.update_output("   => 正在計算最大延遲時間...")
+                max_lateness, details_str = calculate_max_lateness(cache['end_dict'], cache['jobs'])
+                self.update_output(details_str) # Show details
+                if max_lateness is not None:
+                    self.update_output(f"      計算完成。最大延遲時間 (Lmax): {max_lateness:.2f}")
+                    if max_lateness <= 0: self.update_output("      (所有工作均準時或提前完成)")
+                else:
+                     self.update_output(f"      未能成功計算最大延遲時間。")
+                processed = True
+
+            # ** Add new metrics processing **
+            elif command_key == "total_tardiness":
+                 self.update_output("   => 正在計算總延遲時間...")
+                 total_tardiness, details_str = calculate_total_tardiness(cache['end_dict'], cache['jobs'])
+                 self.update_output(details_str) # Show details of tardy jobs
+                 self.update_output(f"      計算完成。總延遲時間 (ΣTj): {total_tardiness:.2f}")
+                 processed = True
+
+            elif command_key == "num_tardy":
+                 self.update_output("   => 正在計算延遲工作數...")
+                 num_tardy, details_str = calculate_num_tardy_jobs(cache['end_dict'], cache['jobs'])
+                 self.update_output(details_str) # Show list of tardy jobs
+                 self.update_output(f"      計算完成。延遲工作數 (ΣUj): {num_tardy}")
+                 processed = True
+
+            elif command_key == "total_flowtime":
+                 self.update_output("   => 正在計算總流程時間...")
+                 total_flow_time, details_str = calculate_total_flow_time(cache['end_dict'], cache['jobs'])
+                 self.update_output(details_str) # Show individual flow times
+                 self.update_output(f"      計算完成。總流程時間 (ΣFj): {total_flow_time:.2f}")
+                 processed = True
+
+            elif command_key == "convergence":
+                 history = cache['history']
+                 if history:
+                     self.update_output("   => 正在準備繪製收斂曲線...")
+                     # (Plotting logic remains the same)
+                     plt.figure(figsize=(10, 5))
+                     plt.plot(range(1, len(history) + 1), history, marker='.', linestyle='-')
+                     plt.xlabel("Generation")
+                     plt.ylabel("Best Makespan Found")
+                     plt.title("GA Convergence Curve")
+                     plt.grid(True)
+                     plt.tight_layout()
+                     plt.show()
+                     self.update_output("      (收斂曲線應在單獨視窗中顯示)")
+                 else:
+                     self.update_output("   => 沒有可用的收斂歷史數據。")
+                 processed = True
+
+            # If command key was valid but not handled above (shouldn't happen)
+            if not processed:
+                 self.update_output(f"(!) 內部錯誤：無法處理已識別的指令 '{command_key}'。")
+
+
+        except Exception as e:
+            self.update_output(f"(!) 處理指令 '{command_key}' 時發生錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # **** MODIFIED display_all_results ****
+    def display_all_results(self):
+        """Displays all standard results after GA run."""
+        self.update_output("--- 顯示所有結果 ---")
+        if not self.ga_run_successful or self.ga_results_cache is None:
+            self.update_output("(!) 錯誤：無法顯示所有結果，因為 GA 計算未成功或結果不可用。")
+            return
+
+        # ** Call new metrics as well, in a logical order **
+        self.process_command_with_results("makespan")
+        self.update_output("---") # Separator
+        self.process_command_with_results("lateness")
+        self.update_output("---")
+        self.process_command_with_results("total_tardiness")
+        self.update_output("---")
+        self.process_command_with_results("num_tardy")
+        self.update_output("---")
+        self.process_command_with_results("total_flowtime")
+        self.update_output("---")
+        self.process_command_with_results("convergence") # Plot convergence
+        self.update_output("---")
+        self.process_command_with_results("gantt")       # Plot gantt last
+        self.update_output("--- 所有結果顯示完畢 ---")
+
+# (主執行區塊 if __name__ == "__main__": 不變)
+if __name__ == "__main__":
+    try:
+        import matplotlib
+        # matplotlib.use('TkAgg')
+    except ImportError:
+        print("Warning: Matplotlib not found. Plotting features will be unavailable.")
+
+    root = tk.Tk()
+    app = FJSP_GUI(root)
+    root.mainloop()
